@@ -1,8 +1,10 @@
 import {
+  type UnocssPluginContext,
   UnoGenerator,
   type UserConfig,
 } from "https://esm.sh/@unocss/core@0.55.1";
 import type { Theme } from "https://esm.sh/@unocss/preset-uno@0.55.1";
+import MagicString from "https://esm.sh/v131/magic-string@0.30.0";
 import { Plugin } from "$fresh/server.ts";
 import { exists } from "$fresh/src/server/deps.ts";
 
@@ -15,6 +17,32 @@ type UnoCssPluginOptions = {
   runtime?: boolean;
   config?: UserConfig;
 };
+
+/** Applies UnoCSS transformers from the config to the given HTML string and returns the result */
+async function applyTransformers(
+  uno: InstanceType<typeof UnoGenerator>,
+  html: string,
+) {
+  const { transformers } = uno.config;
+  if (!transformers?.length) {
+    return html;
+  }
+
+  const mutableHtml = new MagicString(html);
+
+  // Sort transformers according to "enforce" property (if present)
+  transformers.sort((a, b) => {
+    const key = (x: typeof a) =>
+      x.enforce === undefined ? 0 : (x.enforce === "pre" ? -1 : 1);
+    return key(a) - key(b);
+  });
+
+  // Apply transformers and return the result
+  for (const { transform } of transformers) {
+    await transform(mutableHtml, "html", { uno } as UnocssPluginContext);
+  }
+  return mutableHtml.toString();
+}
 
 /**
  * Helper function for typing of config objects
@@ -73,10 +101,13 @@ export default function unocss(
       : {},
     async renderAsync(ctx) {
       const { htmlText } = await ctx.renderAsync();
-      const { css } = await uno.generate(htmlText);
+      const transformedHtml = await applyTransformers(uno, htmlText);
+      const { css } = await uno.generate(transformedHtml);
+
       return {
         scripts: runtime ? [{ entrypoint: "main", state: {} }] : [],
         styles: [{ cssText: `${unoResetCSS}\n${css}` }],
+        htmlText: transformedHtml,
       };
     },
   };
