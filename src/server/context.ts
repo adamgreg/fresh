@@ -1,10 +1,7 @@
 import {
   colors,
-  dirname,
   extname,
-  fromFileUrl,
   join,
-  JSONC,
   Status,
   toFileUrl,
   typeByExtension,
@@ -12,17 +9,17 @@ import {
 } from "./deps.ts";
 import { ComponentType, h } from "preact";
 import * as router from "./router.ts";
-import { DenoConfig, Manifest } from "./mod.ts";
+import { FreshConfig, Manifest } from "./mod.ts";
 import { ALIVE_URL, JS_PREFIX, REFRESH_JS_URL } from "./constants.ts";
 import { BUILD_ID, setBuildId } from "./build_id.ts";
-import DefaultErrorHandler from "./default_error_page.ts";
+import DefaultErrorHandler from "./default_error_page.tsx";
 import {
   AppModule,
   BaseRoute,
   ErrorPage,
   ErrorPageModule,
-  FreshOptions,
   Handler,
+  InternalFreshConfig,
   Island,
   LayoutModule,
   LayoutRoute,
@@ -58,6 +55,8 @@ import {
 } from "../build/mod.ts";
 import { InternalRoute } from "./router.ts";
 import { setAllIslands } from "./rendering/preact_hooks.ts";
+import { getCodeFrame } from "./code_frame.ts";
+import { getFreshConfigWithDefaults } from "./config.ts";
 
 const DEFAULT_CONN_INFO: ServeHandlerInfo = {
   localAddr: { transport: "tcp", hostname: "localhost", port: 8080 },
@@ -65,17 +64,6 @@ const DEFAULT_CONN_INFO: ServeHandlerInfo = {
 };
 
 const ROOT_BASE_ROUTE = toBaseRoute("/");
-
-function isObject(value: unknown) {
-  return typeof value === "object" &&
-    !Array.isArray(value) &&
-    value !== null;
-}
-
-function isDevMode() {
-  // Env var is only set in prod (on Deploy).
-  return Deno.env.get("DENO_DEPLOYMENT_ID") === undefined;
-}
 
 interface StaticFile {
   /** The URL to the static file on disk. */
@@ -88,6 +76,327 @@ interface StaticFile {
   contentType: string;
   /** Hash of the file contents. */
   etag: string;
+}
+
+/**
+ * @deprecated Use {@linkcode FromManifestConfig} instead
+ */
+export type FromManifestOptions = FromManifestConfig;
+
+export type FromManifestConfig = FreshConfig & {
+  skipSnapshot?: boolean;
+  dev?: boolean;
+};
+
+export async function getServerContext(opts: InternalFreshConfig) {
+  const { manifest, denoJson: config, denoJsonPath: configPath } = opts;
+  // Get the manifest' base URL.
+  const baseUrl = new URL("./", manifest.baseUrl).href;
+
+  // Restore snapshot if available
+  let snapshot: BuildSnapshot | null = null;
+  if (opts.loadSnapshot) {
+    const snapshotDirPath = opts.build.outDir;
+    try {
+      if ((await Deno.stat(snapshotDirPath)).isDirectory) {
+        console.log(
+          `Using snapshot found at ${colors.cyan(snapshotDirPath)}`,
+        );
+
+        const snapshotPath = join(snapshotDirPath, "snapshot.json");
+        const json = JSON.parse(
+          await Deno.readTextFile(snapshotPath),
+        ) as BuildSnapshotJson;
+        setBuildId(json.build_id);
+
+        const dependencies = new Map<string, string[]>(
+          Object.entries(json.files),
+        );
+
+        const files = new Map<string, string>();
+        Object.keys(json.files).forEach((name) => {
+          const filePath = join(snapshotDirPath, name);
+          files.set(name, filePath);
+        });
+
+        snapshot = new AotSnapshot(files, dependencies);
+      }
+    } catch (err) {
+      if (!(err instanceof Deno.errors.NotFound)) {
+        throw err;
+      }
+    }
+  }
+
+  config.compilerOptions ??= {};
+
+  let jsx: "react" | "react-jsx";
+  switch (config.compilerOptions.jsx) {
+    case "react":
+    case undefined:
+      jsx = "react";
+      break;
+    case "react-jsx":
+      jsx = "react-jsx";
+      break;
+    default:
+      throw new Error("Unknown jsx option: " + config.compilerOptions.jsx);
+  }
+
+  const jsxConfig: JSXConfig = {
+    jsx,
+    jsxImportSource: config.compilerOptions.jsxImportSource,
+  };
+
+  // Extract all routes, and prepare them into the `Page` structure.
+  const routes: Route[] = [];
+  const islands: Island[] = [];
+  const middlewares: MiddlewareRoute[] = [];
+  let app: AppModule = DEFAULT_APP;
+  const layouts: LayoutRoute[] = [];
+  let notFound: UnknownPage = DEFAULT_NOT_FOUND;
+  let error: ErrorPage = DEFAULT_ERROR;
+  const allRoutes = [
+    ...Object.entries(manifest.routes),
+    ...(opts.plugins ? getMiddlewareRoutesFromPlugins(opts.plugins) : []),
+    ...(opts.plugins ? getRoutesFromPlugins(opts.plugins) : []),
+  ];
+
+  // Presort all routes so that we only need to sort once
+  allRoutes.sort((a, b) => sortRoutePaths(a[0], b[0]));
+
+  for (
+    const [self, module] of allRoutes
+  ) {
+    const url = new URL(self, baseUrl).href;
+    if (!url.startsWith(baseUrl + "routes")) {
+      throw new TypeError("Page is not a child of the basepath.");
+    }
+    const path = url.substring(baseUrl.length).substring("routes".length);
+    const baseRoute = path.substring(1, path.length - extname(path).length);
+    const name = baseRoute.replace("/", "-");
+    const isLayout = path.endsWith("/_layout.tsx") ||
+      path.endsWith("/_layout.ts") || path.endsWith("/_layout.jsx") ||
+      path.endsWith("/_layout.js");
+    const isMiddleware = path.endsWith("/_middleware.tsx") ||
+      path.endsWith("/_middleware.ts") || path.endsWith("/_middleware.jsx") ||
+      path.endsWith("/_middleware.js");
+    if (
+      !path.startsWith("/_") && !isLayout && !isMiddleware
+    ) {
+      const { default: component, config } = module as RouteModule;
+      let pattern = pathToPattern(baseRoute);
+      if (config?.routeOverride) {
+        pattern = String(config.routeOverride);
+      }
+      let { handler } = module as RouteModule;
+      if (!handler && "handlers" in module) {
+        throw new Error(
+          `Found named export "handlers" in ${self} instead of "handler". Did you mean "handler"?`,
+        );
+      }
+      handler ??= {};
+      if (
+        component && typeof handler === "object" && handler.GET === undefined
+      ) {
+        handler.GET = (_req, { render }) => render();
+      }
+      if (
+        typeof handler === "object" && handler.GET !== undefined &&
+        handler.HEAD === undefined
+      ) {
+        const GET = handler.GET;
+        handler.HEAD = async (req, ctx) => {
+          const resp = await GET(req, ctx);
+          resp.body?.cancel();
+          return new Response(null, {
+            headers: resp.headers,
+            status: resp.status,
+            statusText: resp.statusText,
+          });
+        };
+      }
+      const route: Route = {
+        baseRoute: toBaseRoute(baseRoute),
+        pattern,
+        url,
+        name,
+        component,
+        handler,
+        csp: Boolean(config?.csp ?? false),
+        appWrapper: !config?.skipAppWrapper,
+        inheritLayouts: !config?.skipInheritedLayouts,
+      };
+      routes.push(route);
+    } else if (isMiddleware) {
+      middlewares.push({
+        baseRoute: toBaseRoute(baseRoute),
+        module: module as MiddlewareModule,
+      });
+    } else if (
+      path === "/_app.tsx" || path === "/_app.ts" ||
+      path === "/_app.jsx" || path === "/_app.js"
+    ) {
+      app = module as AppModule;
+    } else if (isLayout) {
+      const mod = module as LayoutModule;
+      const config = mod.config;
+      layouts.push({
+        baseRoute: toBaseRoute(baseRoute),
+        handler: mod.handler,
+        component: mod.default,
+        appWrapper: !config?.skipAppWrapper,
+        inheritLayouts: !config?.skipInheritedLayouts,
+      });
+    } else if (
+      path === "/_404.tsx" || path === "/_404.ts" ||
+      path === "/_404.jsx" || path === "/_404.js"
+    ) {
+      const { default: component, config } = module as UnknownPageModule;
+      let { handler } = module as UnknownPageModule;
+      if (component && handler === undefined) {
+        handler = (_req, { render }) => render();
+      }
+
+      notFound = {
+        baseRoute: ROOT_BASE_ROUTE,
+        pattern: pathToPattern(baseRoute),
+        url,
+        name,
+        component,
+        handler: handler ?? ((req) => router.defaultOtherHandler(req)),
+        csp: Boolean(config?.csp ?? false),
+        appWrapper: !config?.skipAppWrapper,
+        inheritLayouts: !config?.skipInheritedLayouts,
+      };
+    } else if (
+      path === "/_500.tsx" || path === "/_500.ts" ||
+      path === "/_500.jsx" || path === "/_500.js"
+    ) {
+      const { default: component, config } = module as ErrorPageModule;
+      let { handler } = module as ErrorPageModule;
+      if (component && handler === undefined) {
+        handler = (_req, { render }) => render();
+      }
+
+      error = {
+        baseRoute: toBaseRoute("/"),
+        pattern: pathToPattern(baseRoute),
+        url,
+        name,
+        component,
+        handler: (req, ctx) => {
+          if (opts.dev) {
+            const prevComp = error.component;
+            error.component = DefaultErrorHandler;
+            try {
+              return ctx.render();
+            } finally {
+              error.component = prevComp;
+            }
+          }
+
+          return handler
+            ? handler(req, ctx)
+            : router.defaultErrorHandler(req, ctx, ctx.error);
+        },
+        csp: Boolean(config?.csp ?? false),
+        appWrapper: !config?.skipAppWrapper,
+        inheritLayouts: !config?.skipInheritedLayouts,
+      };
+    }
+  }
+
+  for (const [self, module] of Object.entries(manifest.islands)) {
+    const url = new URL(self, baseUrl).href;
+    if (!url.startsWith(baseUrl)) {
+      throw new TypeError("Island is not a child of the basepath.");
+    }
+    let path = url.substring(baseUrl.length);
+    if (path.startsWith("islands")) {
+      path = path.slice("islands".length + 1);
+    }
+    const baseRoute = path.substring(0, path.length - extname(path).length);
+
+    for (const [exportName, exportedFunction] of Object.entries(module)) {
+      if (typeof exportedFunction !== "function") {
+        continue;
+      }
+      const name = sanitizeIslandName(baseRoute);
+      const id = `${name}_${exportName}`.toLowerCase();
+      islands.push({
+        id,
+        name,
+        url,
+        component: exportedFunction,
+        exportName,
+      });
+    }
+  }
+
+  const staticFiles: StaticFile[] = [];
+  try {
+    const staticDirUrl = toFileUrl(opts.staticDir);
+    const entries = walk(opts.staticDir, {
+      includeFiles: true,
+      includeDirs: false,
+      followSymlinks: false,
+    });
+    const encoder = new TextEncoder();
+    for await (const entry of entries) {
+      const localUrl = toFileUrl(entry.path);
+      const path = localUrl.href.substring(staticDirUrl.href.length);
+      const stat = await Deno.stat(localUrl);
+      const contentType = typeByExtension(extname(path)) ??
+        "application/octet-stream";
+      const etag = await crypto.subtle.digest(
+        "SHA-1",
+        encoder.encode(BUILD_ID + path),
+      ).then((hash) =>
+        Array.from(new Uint8Array(hash))
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("")
+      );
+      const staticFile: StaticFile = {
+        localUrl,
+        path,
+        size: stat.size,
+        contentType,
+        etag,
+      };
+      staticFiles.push(staticFile);
+    }
+  } catch (err) {
+    if (err.cause instanceof Deno.errors.NotFound) {
+      // Do nothing.
+    } else {
+      throw err;
+    }
+  }
+
+  if (opts.dev) {
+    // Ensure that debugging hooks are set up for SSR rendering
+    await import("preact/debug");
+  }
+
+  return new ServerContext(
+    routes,
+    islands,
+    staticFiles,
+    opts.render ?? DEFAULT_RENDER_FN,
+    middlewares,
+    app,
+    layouts,
+    notFound,
+    error,
+    opts.plugins ?? [],
+    configPath,
+    jsxConfig,
+    opts.dev,
+    opts.router ?? DEFAULT_ROUTER_OPTIONS,
+    opts.build.target,
+    snapshot,
+  );
 }
 
 export class ServerContext {
@@ -118,8 +427,9 @@ export class ServerContext {
     plugins: Plugin[],
     configPath: string,
     jsxConfig: JSXConfig,
-    dev: boolean = isDevMode(),
+    dev: boolean,
     routerOptions: RouterOptions,
+    target: string | string[],
     snapshot: BuildSnapshot | null = null,
   ) {
     this.#routes = routes;
@@ -139,6 +449,7 @@ export class ServerContext {
       configPath,
       dev: this.#dev,
       jsxConfig,
+      target,
     });
     this.#routerOptions = routerOptions;
   }
@@ -148,323 +459,21 @@ export class ServerContext {
    */
   static async fromManifest(
     manifest: Manifest,
-    opts: FreshOptions & { skipSnapshot?: boolean; dev?: boolean },
+    config: FromManifestConfig,
   ): Promise<ServerContext> {
-    // Get the manifest' base URL.
-    const baseUrl = new URL("./", manifest.baseUrl).href;
+    const isLegacyDev = Deno.env.get("__FRSH_LEGACY_DEV") === "true";
+    config.dev = isLegacyDev ||
+      Boolean(config.dev);
 
-    const { config, path: configPath } = await readDenoConfig(
-      fromFileUrl(baseUrl),
+    if (isLegacyDev) {
+      config.skipSnapshot = true;
+    }
+
+    const configWithDefaults = await getFreshConfigWithDefaults(
+      manifest,
+      config,
     );
-    if (typeof config.importMap !== "string" && !isObject(config.imports)) {
-      throw new Error(
-        "deno.json must contain an 'importMap' or 'imports' property.",
-      );
-    }
-
-    // Restore snapshot if available
-    let snapshot: BuildSnapshot | null = null;
-    // Load from snapshot if not explicitly requested not to
-    let loadFromSnapshot = !opts.skipSnapshot;
-    // We still need to check for a legacy entry point :S
-    if (Deno.env.has("__FRSH_LEGACY_DEV")) {
-      loadFromSnapshot = false;
-    }
-    if (loadFromSnapshot) {
-      const snapshotDirPath = join(
-        dirname(fromFileUrl(manifest.baseUrl)),
-        "_fresh",
-      );
-      try {
-        if ((await Deno.stat(snapshotDirPath)).isDirectory) {
-          console.log(
-            `Using snapshot found at ${colors.cyan(snapshotDirPath)}`,
-          );
-
-          const snapshotPath = join(snapshotDirPath, "snapshot.json");
-          const json = JSON.parse(
-            await Deno.readTextFile(snapshotPath),
-          ) as BuildSnapshotJson;
-          setBuildId(json.build_id);
-
-          const dependencies = new Map<string, string[]>(
-            Object.entries(json.files),
-          );
-
-          const files = new Map<string, string>();
-          Object.keys(json.files).forEach((name) => {
-            const filePath = join(snapshotDirPath, name);
-            files.set(name, filePath);
-          });
-
-          snapshot = new AotSnapshot(files, dependencies);
-        }
-      } catch (err) {
-        if (!(err instanceof Deno.errors.NotFound)) {
-          throw err;
-        }
-      }
-    }
-
-    config.compilerOptions ??= {};
-
-    let jsx: "react" | "react-jsx";
-    switch (config.compilerOptions.jsx) {
-      case "react":
-      case undefined:
-        jsx = "react";
-        break;
-      case "react-jsx":
-        jsx = "react-jsx";
-        break;
-      default:
-        throw new Error("Unknown jsx option: " + config.compilerOptions.jsx);
-    }
-
-    const jsxConfig: JSXConfig = {
-      jsx,
-      jsxImportSource: config.compilerOptions.jsxImportSource,
-    };
-
-    // Extract all routes, and prepare them into the `Page` structure.
-    const routes: Route[] = [];
-    const islands: Island[] = [];
-    const middlewares: MiddlewareRoute[] = [];
-    let app: AppModule = DEFAULT_APP;
-    const layouts: LayoutRoute[] = [];
-    let notFound: UnknownPage = DEFAULT_NOT_FOUND;
-    let error: ErrorPage = DEFAULT_ERROR;
-    const allRoutes = [
-      ...Object.entries(manifest.routes),
-      ...(opts.plugins ? getMiddlewareRoutesFromPlugins(opts.plugins) : []),
-      ...(opts.plugins ? getRoutesFromPlugins(opts.plugins) : []),
-    ];
-
-    // Presort all routes so that we only need to sort once
-    allRoutes.sort((a, b) => sortRoutePaths(a[0], b[0]));
-
-    for (
-      const [self, module] of allRoutes
-    ) {
-      const url = new URL(self, baseUrl).href;
-      if (!url.startsWith(baseUrl + "routes")) {
-        throw new TypeError("Page is not a child of the basepath.");
-      }
-      const path = url.substring(baseUrl.length).substring("routes".length);
-      const baseRoute = path.substring(1, path.length - extname(path).length);
-      const name = baseRoute.replace("/", "-");
-      const isLayout = path.endsWith("/_layout.tsx") ||
-        path.endsWith("/_layout.ts") || path.endsWith("/_layout.jsx") ||
-        path.endsWith("/_layout.js");
-      const isMiddleware = path.endsWith("/_middleware.tsx") ||
-        path.endsWith("/_middleware.ts") || path.endsWith("/_middleware.jsx") ||
-        path.endsWith("/_middleware.js");
-      if (
-        !path.startsWith("/_") && !isLayout && !isMiddleware
-      ) {
-        const { default: component, config } = module as RouteModule;
-        let pattern = pathToPattern(baseRoute);
-        if (config?.routeOverride) {
-          pattern = String(config.routeOverride);
-        }
-        let { handler } = module as RouteModule;
-        if (!handler && "handlers" in module) {
-          throw new Error(
-            `Found named export "handlers" in ${self} instead of "handler". Did you mean "handler"?`,
-          );
-        }
-        handler ??= {};
-        if (
-          component && typeof handler === "object" && handler.GET === undefined
-        ) {
-          handler.GET = (_req, { render }) => render();
-        }
-        if (
-          typeof handler === "object" && handler.GET !== undefined &&
-          handler.HEAD === undefined
-        ) {
-          const GET = handler.GET;
-          handler.HEAD = async (req, ctx) => {
-            const resp = await GET(req, ctx);
-            resp.body?.cancel();
-            return new Response(null, {
-              headers: resp.headers,
-              status: resp.status,
-              statusText: resp.statusText,
-            });
-          };
-        }
-        const route: Route = {
-          baseRoute: toBaseRoute(baseRoute),
-          pattern,
-          url,
-          name,
-          component,
-          handler,
-          csp: Boolean(config?.csp ?? false),
-          appWrapper: !config?.skipAppWrapper,
-          inheritLayouts: !config?.skipInheritedLayouts,
-        };
-        routes.push(route);
-      } else if (isMiddleware) {
-        middlewares.push({
-          baseRoute: toBaseRoute(baseRoute),
-          module: module as MiddlewareModule,
-        });
-      } else if (
-        path === "/_app.tsx" || path === "/_app.ts" ||
-        path === "/_app.jsx" || path === "/_app.js"
-      ) {
-        app = module as AppModule;
-      } else if (isLayout) {
-        const mod = module as LayoutModule;
-        const config = mod.config;
-        layouts.push({
-          baseRoute: toBaseRoute(baseRoute),
-          handler: mod.handler,
-          component: mod.default,
-          appWrapper: !config?.skipAppWrapper,
-          inheritLayouts: !config?.skipInheritedLayouts,
-        });
-      } else if (
-        path === "/_404.tsx" || path === "/_404.ts" ||
-        path === "/_404.jsx" || path === "/_404.js"
-      ) {
-        const { default: component, config } = module as UnknownPageModule;
-        let { handler } = module as UnknownPageModule;
-        if (component && handler === undefined) {
-          handler = (_req, { render }) => render();
-        }
-
-        notFound = {
-          baseRoute: ROOT_BASE_ROUTE,
-          pattern: pathToPattern(baseRoute),
-          url,
-          name,
-          component,
-          handler: handler ?? ((req) => router.defaultOtherHandler(req)),
-          csp: Boolean(config?.csp ?? false),
-          appWrapper: !config?.skipAppWrapper,
-          inheritLayouts: !config?.skipInheritedLayouts,
-        };
-      } else if (
-        path === "/_500.tsx" || path === "/_500.ts" ||
-        path === "/_500.jsx" || path === "/_500.js"
-      ) {
-        const { default: component, config } = module as ErrorPageModule;
-        let { handler } = module as ErrorPageModule;
-        if (component && handler === undefined) {
-          handler = (_req, { render }) => render();
-        }
-
-        error = {
-          baseRoute: toBaseRoute("/"),
-          pattern: pathToPattern(baseRoute),
-          url,
-          name,
-          component,
-          handler: handler ??
-            ((req, ctx) => router.defaultErrorHandler(req, ctx, ctx.error)),
-          csp: Boolean(config?.csp ?? false),
-          appWrapper: !config?.skipAppWrapper,
-          inheritLayouts: !config?.skipInheritedLayouts,
-        };
-      }
-    }
-
-    for (const [self, module] of Object.entries(manifest.islands)) {
-      const url = new URL(self, baseUrl).href;
-      if (!url.startsWith(baseUrl)) {
-        throw new TypeError("Island is not a child of the basepath.");
-      }
-      let path = url.substring(baseUrl.length);
-      if (path.startsWith("islands")) {
-        path = path.slice("islands".length + 1);
-      }
-      const baseRoute = path.substring(0, path.length - extname(path).length);
-
-      for (const [exportName, exportedFunction] of Object.entries(module)) {
-        if (typeof exportedFunction !== "function") {
-          continue;
-        }
-        const name = sanitizeIslandName(baseRoute);
-        const id = `${name}_${exportName}`.toLowerCase();
-        islands.push({
-          id,
-          name,
-          url,
-          component: exportedFunction,
-          exportName,
-        });
-      }
-    }
-
-    const staticFiles: StaticFile[] = [];
-    try {
-      const staticFolder = new URL(
-        opts.staticDir ?? "./static",
-        manifest.baseUrl,
-      );
-      const entries = walk(fromFileUrl(staticFolder), {
-        includeFiles: true,
-        includeDirs: false,
-        followSymlinks: false,
-      });
-      const encoder = new TextEncoder();
-      for await (const entry of entries) {
-        const localUrl = toFileUrl(entry.path);
-        const path = localUrl.href.substring(staticFolder.href.length);
-        const stat = await Deno.stat(localUrl);
-        const contentType = typeByExtension(extname(path)) ??
-          "application/octet-stream";
-        const etag = await crypto.subtle.digest(
-          "SHA-1",
-          encoder.encode(BUILD_ID + path),
-        ).then((hash) =>
-          Array.from(new Uint8Array(hash))
-            .map((byte) => byte.toString(16).padStart(2, "0"))
-            .join("")
-        );
-        const staticFile: StaticFile = {
-          localUrl,
-          path,
-          size: stat.size,
-          contentType,
-          etag,
-        };
-        staticFiles.push(staticFile);
-      }
-    } catch (err) {
-      if (err.cause instanceof Deno.errors.NotFound) {
-        // Do nothing.
-      } else {
-        throw err;
-      }
-    }
-
-    const dev = opts.dev ?? isDevMode();
-    if (dev) {
-      // Ensure that debugging hooks are set up for SSR rendering
-      await import("preact/debug");
-    }
-
-    return new ServerContext(
-      routes,
-      islands,
-      staticFiles,
-      opts.render ?? DEFAULT_RENDER_FN,
-      middlewares,
-      app,
-      layouts,
-      notFound,
-      error,
-      opts.plugins ?? [],
-      configPath,
-      jsxConfig,
-      dev,
-      opts.router ?? DEFAULT_ROUTER_OPTIONS,
-      snapshot,
-    );
+    return getServerContext(configWithDefaults);
   }
 
   /**
@@ -790,12 +799,12 @@ export class ServerContext {
         // deno-lint-ignore no-explicit-any
         ctx?: any,
         error?: unknown,
+        codeFrame?: string,
       ) => {
         return async (data?: Data, options?: RenderOptions) => {
           if (route.component === undefined) {
             throw new Error("This page does not have a component to render.");
           }
-
           const layouts = selectSharedRoutes(route.baseRoute, this.#layouts);
 
           const resp = await internalRender({
@@ -818,6 +827,7 @@ export class ServerContext {
             data,
             state: ctx?.state,
             error,
+            codeFrame,
           });
 
           if (resp instanceof Response) {
@@ -895,7 +905,7 @@ export class ServerContext {
       this.#error,
       Status.InternalServerError,
     );
-    const errorHandler: router.ErrorHandler<RouterState> = (
+    const errorHandler: router.ErrorHandler<RouterState> = async (
       req,
       ctx,
       error,
@@ -903,14 +913,24 @@ export class ServerContext {
       console.error(
         "%cAn error occurred during route handling or page rendering.",
         "color:red",
-        error,
       );
+      let codeFrame: string | undefined;
+      if (this.#dev && error instanceof Error) {
+        codeFrame = await getCodeFrame(error);
+
+        if (codeFrame) {
+          console.error();
+          console.error(codeFrame);
+        }
+      }
+      console.error(error);
+
       return this.#error.handler(
         req,
         {
           ...ctx,
           error,
-          render: errorHandlerRender(req, {}, ctx, error),
+          render: errorHandlerRender(req, {}, ctx, error, codeFrame),
         },
       );
     };
@@ -1331,36 +1351,6 @@ function collectEntrypoints(
   }
 
   return entryPoints;
-}
-
-async function readDenoConfig(
-  directory: string,
-): Promise<{ config: DenoConfig; path: string }> {
-  let dir = directory;
-  while (true) {
-    for (const name of ["deno.json", "deno.jsonc"]) {
-      const path = join(dir, name);
-      try {
-        const file = await Deno.readTextFile(path);
-        if (name.endsWith(".jsonc")) {
-          return { config: JSONC.parse(file) as DenoConfig, path };
-        } else {
-          return { config: JSON.parse(file), path };
-        }
-      } catch (err) {
-        if (!(err instanceof Deno.errors.NotFound)) {
-          throw err;
-        }
-      }
-    }
-    const parent = dirname(dir);
-    if (parent === dir) {
-      throw new Error(
-        `Could not find a deno.json file in the current directory or any parent directory.`,
-      );
-    }
-    dir = parent;
-  }
 }
 
 function formatMiddlewarePath(path: string): string {

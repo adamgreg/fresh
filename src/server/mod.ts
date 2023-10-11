@@ -1,16 +1,16 @@
-import { LayoutConfig } from "$fresh/server.ts";
-import { ComponentChildren } from "preact";
 import { ServerContext } from "./context.ts";
+export type { FromManifestConfig, FromManifestOptions } from "./context.ts";
 export { Status } from "./deps.ts";
 import {
   ErrorHandler,
+  FreshConfig,
   Handler,
   Handlers,
   IslandModule,
+  LayoutConfig,
   MiddlewareModule,
   RouteConfig,
   ServeHandlerInfo,
-  StartOptions,
   UnknownHandler,
 } from "./types.ts";
 import { startFromContext } from "./boot.ts";
@@ -23,9 +23,11 @@ export {
 export type {
   AppContext,
   AppProps,
+  DenoConfig,
   ErrorHandler,
   ErrorHandlerContext,
   ErrorPageProps,
+  FreshConfig,
   FreshOptions,
   Handler,
   HandlerContext,
@@ -70,7 +72,8 @@ export interface Manifest {
         propsOrRequest: any,
         // deno-lint-ignore no-explicit-any
         ctx: any,
-      ) => Promise<ComponentChildren | Response> | ComponentChildren;
+        // deno-lint-ignore no-explicit-any
+      ) => Promise<any | Response> | any;
       // deno-lint-ignore no-explicit-any
       handler?: Handler<any, any> | Handlers<any, any> | UnknownHandler;
       config?: RouteConfig | LayoutConfig | ErrorHandler;
@@ -80,36 +83,23 @@ export interface Manifest {
   baseUrl: string;
 }
 
-export interface DenoConfig {
-  imports?: Record<string, string>;
-  importMap?: string;
-  tasks?: Record<string, string>;
-  lint?: {
-    rules: { tags?: string[] };
-    exclude?: string[];
-  };
-  fmt?: {
-    exclude?: string[];
-  };
-  compilerOptions?: {
-    jsx?: string;
-    jsxImportSource?: string;
-  };
-}
-
 export { ServerContext };
 
 export async function createHandler(
-  routes: Manifest,
-  opts: StartOptions = {},
+  manifest: Manifest,
+  config: FreshConfig = {},
 ): Promise<
   (req: Request, connInfo?: ServeHandlerInfo) => Promise<Response>
 > {
-  const ctx = await ServerContext.fromManifest(routes, opts);
+  const ctx = await ServerContext.fromManifest(manifest, config);
   return ctx.handler();
 }
 
-export async function start(routes: Manifest, opts: StartOptions = {}) {
-  const ctx = await ServerContext.fromManifest(routes, opts);
-  await startFromContext(ctx, opts);
+export async function start(manifest: Manifest, config: FreshConfig = {}) {
+  const ctx = await ServerContext.fromManifest(manifest, {
+    ...config,
+    skipSnapshot: false,
+    dev: false,
+  });
+  await startFromContext(ctx, config.server ?? config);
 }
