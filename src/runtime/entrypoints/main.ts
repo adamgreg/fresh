@@ -1049,7 +1049,7 @@ addEventListener("popstate", async (e) => {
 document.addEventListener("submit", async (e) => {
   const el = e.target;
   if (el !== null && el instanceof HTMLFormElement && !e.defaultPrevented) {
-    if (!checkClientNavEnabled()) {
+    if (!checkClientNavEnabled(el)) {
       return;
     }
 
