@@ -1085,14 +1085,15 @@ document.addEventListener("submit", async (e) => {
       return;
     }
 
-    const action = e.submitter?.getAttribute(PARTIAL_ATTR) ??
+    const partial = e.submitter?.getAttribute(PARTIAL_ATTR) ??
       e.submitter?.getAttribute("formaction") ??
       el.getAttribute(PARTIAL_ATTR) ?? el.action;
 
-    if (action !== "") {
+    if (partial !== "") {
       e.preventDefault();
 
-      const url = new URL(action, location.href);
+      const url = new URL(partial, location.href);
+      const action = e.submitter?.getAttribute("formaction") ?? el.action;
 
       let init: RequestInit | undefined;
 
@@ -1106,7 +1107,7 @@ document.addEventListener("submit", async (e) => {
         init = { body: new FormData(el, e.submitter), method: lowerMethod };
       }
 
-      maybeUpdateHistory(url);
+      maybeUpdateHistory(new URL(action, location.href));
       await fetchPartials(url, init);
     }
   }
