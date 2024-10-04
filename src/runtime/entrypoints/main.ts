@@ -868,9 +868,18 @@ const originalHook = options.vnode;
 options.vnode = (vnode) => {
   assetHashingHook(vnode);
 
-  // Mark active or ancestor links
-  if (vnode.type === "a") {
-    setActiveUrl(vnode, location.pathname);
+  if (typeof vnode.type === "string") {
+    // Mark active or ancestor links
+    if (vnode.type === "a") {
+      setActiveUrl(vnode, location.pathname);
+    }
+
+    if (CLIENT_NAV_ATTR in vnode.props) {
+      const value = vnode.props[CLIENT_NAV_ATTR];
+      if (typeof value === "boolean") {
+        vnode.props[CLIENT_NAV_ATTR] = String(value);
+      }
+    }
   }
 
   if (originalHook) originalHook(vnode);
@@ -927,12 +936,15 @@ function maybeUpdateHistory(nextUrl: URL) {
 
 document.addEventListener("click", async (e) => {
   let el = e.target;
-  if (el && el instanceof HTMLElement) {
+  if (el && (el instanceof HTMLElement || el instanceof SVGElement)) {
     const originalEl = el;
 
     // Check if we clicked inside an anchor link
     if (el.nodeName !== "A") {
       el = el.closest("a");
+    }
+    if (el === null) {
+      el = originalEl.closest("button");
     }
 
     if (
@@ -984,33 +996,22 @@ document.addEventListener("click", async (e) => {
           indicator.value = false;
         }
       }
-    } else {
-      let button: HTMLButtonElement | HTMLElement | null = originalEl;
-      // Check if we clicked on a button
-      if (button.nodeName !== "A") {
-        button = button.closest("button");
+    } else if (
+      el && el instanceof HTMLButtonElement &&
+      (el.type !== "submit" || el.form === null)
+    ) {
+      const partial = el.getAttribute(PARTIAL_ATTR);
+
+      // Check if the user opted out of client side navigation.
+      if (partial === null || !checkClientNavEnabled(el)) {
+        return;
       }
 
-      if (
-        button !== null && button instanceof HTMLButtonElement &&
-        (button.type !== "submit" || button.form === null)
-      ) {
-        const partial = button.getAttribute(PARTIAL_ATTR);
-
-        // Check if the user opted out of client side navigation.
-        if (
-          partial === null ||
-          !checkClientNavEnabled(button)
-        ) {
-          return;
-        }
-
-        const partialUrl = new URL(
-          partial,
-          location.href,
-        );
-        await fetchPartials(partialUrl);
-      }
+      const partialUrl = new URL(
+        partial,
+        location.href,
+      );
+      await fetchPartials(partialUrl);
     }
   }
 });

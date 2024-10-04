@@ -32,6 +32,18 @@ import * as $client_nav_opt_out_injected from "./routes/client_nav_opt_out/injec
 import * as $client_nav_opt_out_page_a from "./routes/client_nav_opt_out/page-a.tsx";
 import * as $client_nav_opt_out_page_b from "./routes/client_nav_opt_out/page-b.tsx";
 import * as $client_nav_opt_out_page_c from "./routes/client_nav_opt_out/page-c.tsx";
+import * as $client_nav_opt_out_island_layout from "./routes/client_nav_opt_out_island/_layout.tsx";
+import * as $client_nav_opt_out_island_index from "./routes/client_nav_opt_out_island/index.tsx";
+import * as $client_nav_opt_out_island_partial from "./routes/client_nav_opt_out_island/partial.tsx";
+import * as $client_nav_opt_out_island_success from "./routes/client_nav_opt_out_island/success.tsx";
+import * as $client_svg_button_layout from "./routes/client_svg_button/_layout.tsx";
+import * as $client_svg_button_fail from "./routes/client_svg_button/fail.tsx";
+import * as $client_svg_button_index from "./routes/client_svg_button/index.tsx";
+import * as $client_svg_button_success from "./routes/client_svg_button/success.tsx";
+import * as $client_svg_link_layout from "./routes/client_svg_link/_layout.tsx";
+import * as $client_svg_link_fail from "./routes/client_svg_link/fail.tsx";
+import * as $client_svg_link_index from "./routes/client_svg_link/index.tsx";
+import * as $client_svg_link_success from "./routes/client_svg_link/success.tsx";
 import * as $deep_partial_index from "./routes/deep_partial/index.tsx";
 import * as $deep_partial_injected from "./routes/deep_partial/injected.tsx";
 import * as $deep_partial_update from "./routes/deep_partial/update.tsx";
@@ -128,6 +140,7 @@ import * as $InvalidSlot from "./islands/InvalidSlot.tsx";
 import * as $KeyExplorer from "./islands/KeyExplorer.tsx";
 import * as $LazyLink from "./islands/LazyLink.tsx";
 import * as $Logger from "./islands/Logger.tsx";
+import * as $OptOutLink from "./islands/OptOutLink.tsx";
 import * as $Other from "./islands/Other.tsx";
 import * as $PartialTrigger from "./islands/PartialTrigger.tsx";
 import * as $PassThrough from "./islands/PassThrough.tsx";
@@ -135,7 +148,7 @@ import * as $PropIsland from "./islands/PropIsland.tsx";
 import * as $SignalProp from "./islands/SignalProp.tsx";
 import * as $Spinner from "./islands/Spinner.tsx";
 import * as $Stateful from "./islands/Stateful.tsx";
-import { type Manifest } from "$fresh/server.ts";
+import type { Manifest } from "$fresh/server.ts";
 
 const manifest = {
   routes: {
@@ -169,6 +182,22 @@ const manifest = {
     "./routes/client_nav_opt_out/page-a.tsx": $client_nav_opt_out_page_a,
     "./routes/client_nav_opt_out/page-b.tsx": $client_nav_opt_out_page_b,
     "./routes/client_nav_opt_out/page-c.tsx": $client_nav_opt_out_page_c,
+    "./routes/client_nav_opt_out_island/_layout.tsx":
+      $client_nav_opt_out_island_layout,
+    "./routes/client_nav_opt_out_island/index.tsx":
+      $client_nav_opt_out_island_index,
+    "./routes/client_nav_opt_out_island/partial.tsx":
+      $client_nav_opt_out_island_partial,
+    "./routes/client_nav_opt_out_island/success.tsx":
+      $client_nav_opt_out_island_success,
+    "./routes/client_svg_button/_layout.tsx": $client_svg_button_layout,
+    "./routes/client_svg_button/fail.tsx": $client_svg_button_fail,
+    "./routes/client_svg_button/index.tsx": $client_svg_button_index,
+    "./routes/client_svg_button/success.tsx": $client_svg_button_success,
+    "./routes/client_svg_link/_layout.tsx": $client_svg_link_layout,
+    "./routes/client_svg_link/fail.tsx": $client_svg_link_fail,
+    "./routes/client_svg_link/index.tsx": $client_svg_link_index,
+    "./routes/client_svg_link/success.tsx": $client_svg_link_success,
     "./routes/deep_partial/index.tsx": $deep_partial_index,
     "./routes/deep_partial/injected.tsx": $deep_partial_injected,
     "./routes/deep_partial/update.tsx": $deep_partial_update,
@@ -278,6 +307,7 @@ const manifest = {
     "./islands/KeyExplorer.tsx": $KeyExplorer,
     "./islands/LazyLink.tsx": $LazyLink,
     "./islands/Logger.tsx": $Logger,
+    "./islands/OptOutLink.tsx": $OptOutLink,
     "./islands/Other.tsx": $Other,
     "./islands/PartialTrigger.tsx": $PartialTrigger,
     "./islands/PassThrough.tsx": $PassThrough,
